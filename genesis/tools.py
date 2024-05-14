@@ -6,6 +6,7 @@ import functools
 import html
 import importlib
 import inspect
+import json
 import logging
 import pathlib
 import string
@@ -14,10 +15,11 @@ import sys
 import traceback
 import uuid
 from numbers import Number
-from typing import Any, Dict, Optional, Tuple, Union, cast
+from typing import Any, Dict, Optional, Tuple, Union
 
 import h5py
 import numpy as np
+from pmd_beamphysics.units import pmd_unit
 import prettytable
 import pydantic
 
@@ -237,11 +239,18 @@ class _DeserializationContext(TypedDict):
     workdir: pathlib.Path
 
 
+_reserved_h5_attrs = {
+    "__python_key_map__",
+    "__num_items__",
+}
+
+
 def store_in_hdf5_file(
     h5: h5py.Group,
     obj: pydantic.BaseModel,
     key: str = "json",
     encoding: str = "utf-8",
+    create_group: bool = False,
 ) -> Tuple[str, _SerializationContext]:
     """
     Store a generic Pydantic model instance in an HDF5 file.
@@ -265,21 +274,108 @@ def store_in_hdf5_file(
     encoding : str, default="utf-8"
         String encoding for the data.
     """
-    context: _SerializationContext = {
-        "hdf5": h5,
-        "array_prefix": key,
-        "array_index": 0,
-    }
-    json_data = obj.model_dump_json(context=cast(dict, context))
-    h5.attrs[f"__{key}_python_class_name__"] = (
-        f"{obj.__module__}.{obj.__class__.__name__}"
-    )
-    h5.create_dataset(
-        name=key,
-        dtype=h5py.string_dtype(encoding=encoding),
-        data=json_data,
-    )
-    return json_data, context
+
+    def dictify(data):
+        if isinstance(data, dict):
+            return {key: dictify(value) for key, value in data.items()}
+        elif data is None:
+            return {
+                "__python_class_name__": type(data).__name__,
+            }
+        elif isinstance(data, pathlib.Path):
+            return {
+                "__python_class_name__": "pathlib.Path",
+                "value": str(data),
+            }
+        elif isinstance(data, str):
+            return data.encode(encoding)
+        elif isinstance(data, (int, float, bool)):
+            return data
+        elif isinstance(data, bytes):
+            # Bytes are less common than strings in our library; assume
+            # byte datasets are encoded strings unless marked like so:
+            return {
+                "__python_class_name__": "bytes",
+                "value": data,
+            }
+        elif isinstance(data, np.ndarray):
+            return data
+        elif isinstance(data, (list, tuple)):
+            try:
+                as_array = np.asarray(data)
+            except ValueError:
+                pass
+            else:
+                if as_array.dtype.kind not in "OU":
+                    return {
+                        "__python_class_name__": type(data).__name__,
+                        "value": as_array,
+                    }
+            items = {f"index_{idx}": dictify(value) for idx, value in enumerate(data)}
+            return {
+                "__python_class_name__": type(data).__name__,
+                "__num_items__": len(items),
+                **items,
+            }
+        elif isinstance(data, pmd_unit):
+            from .version4.types import PydanticPmdUnit
+
+            adapter = pydantic.TypeAdapter(PydanticPmdUnit)
+            return dictify(adapter.dump_python(data, mode="json"))
+        else:
+            raise NotImplementedError(type(data))
+
+    def make_key_map(data):
+        key_to_h5_key = {}
+        h5_key_to_key = {}
+        key_format = "{prefix}__key{idx}__"
+        for idx, key in enumerate(data):
+            if not key.isascii() or "/" in key:
+                prefix = "".join(ch for ch in key if ch.isascii() and ch not in "/")
+                newkey = key_format.format(prefix=prefix, idx=idx)
+                while newkey in h5_key_to_key or newkey in data:
+                    newkey += "_"
+                h5_key_to_key[newkey] = key
+                key_to_h5_key[key] = newkey
+        return key_to_h5_key, h5_key_to_key
+
+    def store(group: h5py.Group, data, depth=0) -> None:
+        for attr in _reserved_h5_attrs:
+            value = data.pop(attr, None)
+            if value:
+                group.attrs[attr] = value
+
+        key_to_h5_key, h5_key_to_key = make_key_map(data)
+        if key_to_h5_key:
+            group.attrs["__python_key_map__"] = json.dumps(h5_key_to_key).encode(
+                encoding
+            )
+
+        for key, value in data.items():
+            h5_key = key_to_h5_key.get(key, key)
+            if h5_key != key:
+                logger.debug(f"{depth * ' '}|- {key} (renamed: {h5_key})")
+            else:
+                logger.debug(f"{depth * ' '}|- {key}")
+
+            if isinstance(value, dict):
+                store(group.create_group(h5_key), value, depth=depth + 1)
+            elif isinstance(value, (str, bytes, int, float, bool)):
+                group.attrs[h5_key] = value
+            elif isinstance(value, (np.ndarray,)):
+                group.create_dataset(h5_key, data=value)
+            else:
+                raise NotImplementedError(type(value))
+
+    data = obj.model_dump()
+
+    if create_group:
+        group = h5.create_group(key)
+    else:
+        group = h5
+
+    group.attrs["__python_class_name__"] = f"{obj.__module__}.{obj.__class__.__name__}"
+    store(group, dictify(data))
 
 
 def restore_from_hdf5_file(
@@ -302,18 +398,82 @@ def restore_from_hdf5_file(
     encoding : str, default="utf-8"
         String encoding for the data.
     """
-    clsname = str(h5.attrs[f"__{key}_python_class_name__"])
+    final_classname = str(h5.attrs["__python_class_name__"])
     try:
-        cls = import_by_name(clsname)
+        cls = import_by_name(final_classname)
     except Exception:
-        logger.exception("Failed to import class: %s", clsname)
+        logger.exception("Failed to import class: %s", final_classname)
         return None
 
-    json_bytes = h5.require_dataset(
-        name=key,
-        dtype=h5py.string_dtype(encoding=encoding),
-        shape=(),
-    )
+    assert issubclass(cls, pydantic.BaseModel)
+
+    def todict(item: Union[h5py.Group, h5py.Dataset, h5py.Datatype], depth=0):
+        if isinstance(item, h5py.Datatype):
+            raise NotImplementedError(str(item))
+
+        if isinstance(item, h5py.Dataset):
+            logger.debug(f"{depth * ' '} -> dataset {item.dtype}")
+            if item.dtype.kind in "SO":
+                return item.asstr()[()]
+            return np.asarray(item)
+
+        python_class_name = item.attrs.get("__python_class_name__", None)
+        if python_class_name:
+            logger.debug(f"{depth * ' '}|- Restoring class {python_class_name}")
+            if python_class_name == "pathlib.Path":
+                return pathlib.Path(item.attrs["value"])
+            if python_class_name == "NoneType":
+                return None
+            if python_class_name == "bytes":
+                return item.attrs["value"]
+            if python_class_name in ("list", "tuple"):
+                if "__num_items__" in item.attrs:
+                    num_items = item.attrs["__num_items__"]
+                    items = [
+                        todict(item[f"index_{idx}"], depth=depth + 1)
+                        for idx in range(num_items)
+                    ]
+                    return tuple(items) if python_class_name == "tuple" else items
+                elif "value" in item:
+                    items = np.asarray(item["value"]).tolist()
+                    return tuple(items) if python_class_name == "tuple" else items
+                else:
+                    raise NotImplementedError("Unsupported list format")
+            cls = import_by_name(python_class_name)
+            if not issubclass(cls, pydantic.BaseModel):
+                raise NotImplementedError(python_class_name)
+
+        logger.debug(f"{depth * ' '}| Restoring dictionary group with keys:")
+        res = {}
+
+        key_map_json = item.attrs.get("__python_key_map__", None)
+        key_map = json.loads(key_map_json) if key_map_json else {}
+
+        for h5_key, group in item.items():
+            key = key_map.get(h5_key, h5_key)
+            if h5_key != key:
+                logger.debug(f"{depth * ' '}|- {key} (h5 key was: {h5_key})")
+            else:
+                logger.debug(f"{depth * ' '}|- {key}")
+
+            res[key] = todict(group, depth=depth + 1)
+
+        for h5_key, value in item.attrs.items():
+            if h5_key in _reserved_h5_attrs:
+                continue
+
+            key = key_map.get(h5_key, h5_key)
+            if h5_key != key:
+                logger.debug(f"{depth * ' '}|- {key} (h5 key was: {h5_key})")
+            else:
+                logger.debug(f"{depth * ' '}|- {key}")
+
+            if hasattr(value, "tolist"):
+                # Get the native type from a numpy scalar
+                value = value.tolist()
+            res[key] = value
+
+        return res
 
     if workdir is None:
         if h5.file.filename:
@@ -321,14 +481,9 @@ def restore_from_hdf5_file(
         else:
             workdir = pathlib.Path(".")
 
-    ctx: _DeserializationContext = {
-        "hdf5": h5,
-        "workdir": workdir,
-    }
-    return cls.model_validate_json(
-        json_bytes[()].decode(encoding),
-        context=ctx,
-    )
+    logger.debug(f"Dictifying data to restore from h5 group: {h5}")
+    data = todict(h5)
+    return cls.model_validate(data)
 
 
 def _truncated_string(value, max_length: int) -> str:

@@ -1,10 +1,13 @@
+import json
 import pathlib
 from typing import Union
 
 import h5py
 import numpy as np
+from pydantic import BaseModel
 import pytest
 
+from ..conftest import test_artifacts
 from ...version4 import Genesis4
 from ...version4.input import (
     AlterSetup,
@@ -143,13 +146,22 @@ def test_hdf_archive(
     genesis4.load_archive(hdf5_filename)
     assert genesis4.output is not None
 
-    assert orig_input.model_dump_json() == genesis4.input.model_dump_json()
-    assert orig_output.model_dump_json() == genesis4.output.model_dump_json()
+    # assert orig_input.model_dump_json(indent=True) == genesis4.input.model_dump_json(indent=True)
+    # assert orig_output.model_dump_json(indent=True) == genesis4.output.model_dump_json(indent=True)
+    assert json_for_comparison(orig_input) == json_for_comparison(genesis4.input)
+    assert json_for_comparison(orig_output) == json_for_comparison(genesis4.output)
+
+
+def json_for_comparison(model: BaseModel) -> str:
+    # Assuming dictionary keys can't be assumed to be sorted
+    data = json.loads(model.model_dump_json())
+    return json.dumps(data, sort_keys=True, indent=True)
 
 
 def test_hdf_archive_using_group(
     genesis4: Genesis4,
-    hdf5_filename: pathlib.Path,
+    request: pytest.FixtureRequest,
+    # hdf5_filename: pathlib.Path,
 ) -> None:
     output = genesis4.run(raise_on_error=True)
     assert output.run.success
@@ -159,6 +171,7 @@ def test_hdf_archive_using_group(
     orig_output = genesis4.output
     assert orig_output is not None
 
+    hdf5_filename = test_artifacts / f"archive-{request.node.name}.h5"
     with h5py.File(hdf5_filename, "w") as h5:
         genesis4.archive(h5)
 
@@ -167,5 +180,9 @@ def test_hdf_archive_using_group(
 
     assert genesis4.output is not None
 
-    assert orig_input.model_dump_json() == genesis4.input.model_dump_json()
-    assert orig_output.model_dump_json() == genesis4.output.model_dump_json()
+    assert json_for_comparison(orig_input) == json_for_comparison(genesis4.input)
+    # with open("orig_output.json", "wt") as fp:
+    #     print(json_for_comparison(orig_output), file=fp)
+    # with open("restored_output.json", "wt") as fp:
+    #     print(json_for_comparison(genesis4.output), file=fp)
+    assert json_for_comparison(orig_output) == json_for_comparison(genesis4.output)
